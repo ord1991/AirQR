@@ -36,6 +36,7 @@ class AirQRTransceiver:
         self.camera_index = camera_index
         self.current_qr_image = None
         self.last_received_packet = None
+        self.status_text = "Ready"
         self.running = True
         self.lock = threading.Lock()
         # Optimization: Pre-instantiate the QR engine to avoid repeated allocations.
@@ -46,6 +47,11 @@ class AirQRTransceiver:
             border=4,
         )
 
+    def set_status(self, text: str):
+        """Thread-safely updates the current status message."""
+        with self.lock:
+            self.status_text = text
+
     def display_thread(self):
         """Thread to display the current QR code on screen."""
         cv2.namedWindow("AirQR - Display", cv2.WINDOW_NORMAL)
@@ -55,6 +61,11 @@ class AirQRTransceiver:
 
             if img is not None:
                 cv2.imshow("AirQR - Display", img)
+
+            # Check if window was closed via GUI
+            if cv2.getWindowProperty("AirQR - Display", cv2.WND_PROP_VISIBLE) < 1:
+                self.running = False
+                break
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 self.running = False
@@ -81,8 +92,35 @@ class AirQRTransceiver:
                 gray, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU
             )
 
-            # Show camera feed (optional, but helpful for alignment)
+            # Show camera feed with status overlay
+            with self.lock:
+                status = self.status_text
+
+            cv2.putText(
+                frame,
+                f"Status: {status}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2,
+            )
+            cv2.putText(
+                frame,
+                "Press 'Q' to Quit",
+                (10, frame.shape[0] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1,
+            )
+
             cv2.imshow("AirQR - Scanner Feed", frame)
+
+            # Check if window was closed via GUI
+            if cv2.getWindowProperty("AirQR - Scanner Feed", cv2.WND_PROP_VISIBLE) < 1:
+                self.running = False
+                break
 
             # Try to decode QR
             decoded_objs = pyzbar.decode(gray)  # Often works better on gray than thresh
@@ -168,6 +206,7 @@ def run_sender(file_path: str, camera_index: int):
         header_packet = header_base + filename_bytes
 
         print("Displaying Header QR. Waiting for ACK 0...")
+        transceiver.set_status("Waiting for Header ACK...")
         transceiver.set_qr_data(header_packet)
 
         while transceiver.running:
@@ -176,6 +215,7 @@ def run_sender(file_path: str, camera_index: int):
                 p_type, s_id, seq = struct.unpack(ACK_STRUCT, raw_ack)
                 if p_type == PACKET_TYPE_ACK and s_id == session_id and seq == 0:
                     print("Header ACK'd.")
+                    transceiver.set_status("Header ACK'd")
                     break
             time.sleep(0.1)
 
@@ -195,6 +235,7 @@ def run_sender(file_path: str, camera_index: int):
             )
 
             print(f"Sending Chunk {i+1}/{num_chunks}...")
+            transceiver.set_status(f"Sending: {i+1}/{num_chunks}")
             transceiver.set_qr_data(data_packet)
 
             while transceiver.running:
@@ -211,6 +252,7 @@ def run_sender(file_path: str, camera_index: int):
                 time.sleep(0.1)
 
         print("Transfer Complete.")
+        transceiver.set_status("Transfer Complete!")
 
     except Exception as e:
         print(f"An error occurred: {e}")
@@ -237,6 +279,7 @@ def run_receiver(camera_index: int):
         received_chunks = {}
 
         print("Waiting for Header QR...")
+        transceiver.set_status("Waiting for Header...")
 
         # 1. Wait for Header
         while transceiver.running:
@@ -265,6 +308,7 @@ def run_receiver(camera_index: int):
                     print(
                         f"Header received! File: {filename}, Size: {file_size}, Chunks: {num_chunks}"
                     )
+                    transceiver.set_status("Header Received")
 
                     # Send ACK 0
                     ack_packet = struct.pack(ACK_STRUCT, PACKET_TYPE_ACK, session_id, 0)
@@ -289,6 +333,7 @@ def run_receiver(camera_index: int):
                             / 1024
                         )
                         print(f"Received Chunk {seq}/{num_chunks} ({speed:.2f} KB/s)")
+                        transceiver.set_status(f"Receiving: {seq}/{num_chunks}")
 
                     # Always ACK the received chunk (Sender might have missed previous ACK)
                     ack_packet = struct.pack(
@@ -311,12 +356,14 @@ def run_receiver(camera_index: int):
             print(f"Final Hash: {actual_hash.hex()}")
             if actual_hash == expected_hash:
                 print("SUCCESS: Hash match! Bit-for-bit identical.")
+                transceiver.set_status("Success: Verified!")
                 output_path = "received_" + filename
                 with open(output_path, "wb") as f:
                     f.write(full_data)
                 print(f"File saved to {output_path}")
             else:
                 print("FAILURE: Hash mismatch!")
+                transceiver.set_status("Failure: Hash Mismatch")
 
     except Exception as e:
         print(f"An error occurred: {e}")
